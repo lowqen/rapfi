@@ -319,6 +319,13 @@ add_executable(rapfi
     ${HEADERS})
 set_target_properties(rapfi PROPERTIES OUTPUT_NAME "pbrain-rapfi")
 
+# Android only executes files the package manager extracted into the app's
+# nativeLibraryDir, and it only extracts entries named lib*.so.
+if(ANDROID)
+    set_target_properties(rapfi PROPERTIES
+        OUTPUT_NAME "engine" PREFIX "lib" SUFFIX ".so")
+endif()
+
 # external libraries
 add_subdirectory(external/cpptoml)
 add_subdirectory(external/cxxopts)
@@ -602,6 +609,9 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "C
     elseif(NOT EMSCRIPTEN)
         if(NO_MULTI_THREADING AND NO_COMMAND_MODULES)
             target_link_libraries(rapfi PRIVATE -static)
+        elseif(ANDROID)
+            # Bionic implements pthread inside libc: there is no libpthread
+            target_link_libraries(rapfi PRIVATE atomic)
         elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang")
             target_link_libraries(rapfi PRIVATE pthread)
         else()
