@@ -40,6 +40,9 @@ namespace Search {
 
 namespace {
 
+/// Interval (ms) of the periodic node-count print in SearchContext::checkExit().
+constexpr Time StatsPrintInterval = 500;
+
 /// Generate the root move list for the main thread from the current board
 /// position and options: applies block-move filtering, balance2 move pair
 /// expansion, and root symmetry filtering.
@@ -173,6 +176,7 @@ void SearchContext::reset(const SearchOptions &opts, bool ponder)
     options                  = opts;
     inPonder                 = ponder;
     callsCnt                 = 0;
+    lastStatsPrint           = 0;
     startPonderAfterThinking = false;
     resultAction             = ActionType::Move;
     bestMove                 = Pos::NONE;
@@ -197,6 +201,17 @@ void SearchContext::checkExit(uint32_t elapsedCalls)
     // Do not stop searching in pondering mode
     if (inPonder.load(std::memory_order_relaxed))
         return;
+
+    // Periodically report node counters. Otherwise they are only printed when a Pv completes,
+    // and a deep iteration of a long multi-threaded search can go seconds without any count.
+    // Output only: the search itself is unaffected.
+    if (options.infoMode & SearchOptions::INFO_DETAIL) {
+        Time elapsed = timectl.elapsed();
+        if (elapsed - lastStatsPrint >= StatsPrintInterval) {
+            lastStatsPrint = elapsed;
+            printer.printSearchStats(engine->nodesSearched(), elapsed);
+        }
+    }
 
     // Check if we have reached node/time limits
     if (options.maxNodes && engine->nodesSearched() >= options.maxNodes

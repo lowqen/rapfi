@@ -94,6 +94,8 @@ struct SearchContext
     SearchPrinter printer;
     /// Calls count before exit condition check (main search thread only)
     uint32_t callsCnt;
+    /// Elapsed time of the last periodic node-count print (main search thread only)
+    Time lastStatsPrint;
     /// Should we start pondering after finishing this move?
     /// (set during search, read by the protocol thread)
     std::atomic_bool startPonderAfterThinking;

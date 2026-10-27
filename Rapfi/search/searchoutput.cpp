@@ -147,6 +147,13 @@ void SearchPrinter::printPvCompletes(SearchThread      &th,
     }
 }
 
+void SearchPrinter::printSearchStats(uint64_t nodes, int64_t elapsed)
+{
+    INFO("TOTALNODES", nodes);
+    INFO("TOTALTIME", elapsed);
+    INFO("SPEED", nodes * 1000 / std::max<int64_t>(elapsed, 1));
+}
+
 void SearchPrinter::printDepthCompletes(SearchThread &th, const TimeControl &tc, int rootDepth)
 {
     if (Config::GeneralCfg.messageMode == MsgMode::NORMAL) {
