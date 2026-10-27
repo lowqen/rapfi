@@ -2,8 +2,10 @@
 
 This branch is the corresponding source of the engine shipped in RapfiDroid
 (https://github.com/lowqen/RapfiDroid): upstream dhbloo/rapfi `3c94c2a9`, the
-Android build changes in `Rapfi/CMakeLists.txt`, and three result-invariant
-performance patches (K1–K3, one commit each). BENCH stays `e240ab16`.
+Android build changes in `Rapfi/CMakeLists.txt`, and result-invariant patches,
+one commit each: K1–K3 and K7 (speed), R4 P2-2 (no weight reload when the thread
+count changes) and R4 P4-1 (periodic node counters, output only). BENCH stays
+`e240ab16`.
 
 RapfiDroid ships two executables, picked at run time by the CPU:
 
