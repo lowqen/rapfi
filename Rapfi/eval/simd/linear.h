@@ -100,6 +100,83 @@ namespace detail {
                 I32LS::store(output + j * OutB::RegWidth, acc[j]);
             }
         }
+
+        /// The same layer applied to N inputs that share this weight matrix.
+        /// Outputs are processed in tiles of TileRegs registers: each weight vector is loaded
+        /// once per tile and used for all N inputs, and the N x TileRegs accumulators stay in
+        /// registers instead of spilling. For every output lane the accumulation still runs
+        /// over the input chunks in the same order, so the result is bit-identical to calling
+        /// forward() once per input.
+        template <int N, bool SignedInput, bool Bias, bool PreReLU, bool PostReLU>
+        static void forwardMulti(int32_t *const      output[N],
+                                 const int8_t *const input[N],
+                                 const int8_t       *weight,
+                                 const int32_t      *bias)
+        {
+            typedef detail::VecLoadStore<int8_t, Alignment, I>  I8LS;
+            typedef detail::VecLoadStore<int32_t, Alignment, I> I32LS;
+            typedef detail::VecOp<int8_t, I>                    I8Op;
+            typedef detail::VecOp<int32_t, I>                   I32Op;
+            typedef VecBatch<OutSize, int32_t, I>               OutB;
+
+            // Output registers per tile. AArch64 has 32 vector registers, so N = 4 inputs x 4
+            // outputs + 4 weights fit without spilling; 16-register ISAs keep the tile at 2.
+#ifndef RAPFI_MULTI_TILE_REGS
+    #ifdef USE_NEON
+        #define RAPFI_MULTI_TILE_REGS 4
+    #else
+        #define RAPFI_MULTI_TILE_REGS 2
+    #endif
+#endif
+            constexpr int TileRegs = OutB::NumBatch % RAPFI_MULTI_TILE_REGS == 0 ? RAPFI_MULTI_TILE_REGS
+                                     : OutB::NumBatch % 2 == 0                   ? 2
+                                                                                 : 1;
+
+            const int32_t *input32[N];
+            for (int n = 0; n < N; n++)
+                input32[n] = reinterpret_cast<const int32_t *>(input[n]);
+
+            for (int t = 0; t < OutB::NumBatch; t += TileRegs) {
+                typename I32Op::R acc[N][TileRegs];
+                for (int k = 0; k < TileRegs; k++) {
+                    typename I32Op::R init;
+                    if constexpr (Bias)
+                        init = I32LS::load(bias + (t + k) * OutB::RegWidth);
+                    else
+                        init = I32Op::setzero();
+                    for (int n = 0; n < N; n++)
+                        acc[n][k] = init;
+                }
+
+                for (int i = 0; i < NumChunks; i++) {
+                    auto w0 =
+                        reinterpret_cast<const typename I8Op::R *>(weight + i * OutSize * ChunkSize);
+                    typename I8Op::R w[TileRegs];
+                    for (int k = 0; k < TileRegs; k++)
+                        w[k] = I8LS::load(&w0[t + k]);
+
+                    for (int n = 0; n < N; n++) {
+                        auto in0 = typename I8Op::R(I32Op::set1(input32[n][i]));  // Broadcast
+                        if constexpr (PreReLU)
+                            in0 = I8Op::max(in0, I8Op::setzero());
+                        for (int k = 0; k < TileRegs; k++) {
+                            if constexpr (SignedInput)
+                                I8Op::dot4_i8i8_accum(acc[n][k], in0, w[k]);
+                            else
+                                I8Op::dot4_u7i8_accum(acc[n][k], in0, w[k]);
+                        }
+                    }
+                }
+
+                for (int n = 0; n < N; n++)
+                    for (int k = 0; k < TileRegs; k++) {
+                        auto v = acc[n][k];
+                        if constexpr (PostReLU)
+                            v = I32Op::max(v, I32Op::setzero());
+                        I32LS::store(output[n] + (t + k) * OutB::RegWidth, v);
+                    }
+            }
+        }
     };
 
     template <int OutSize, int InSize, int Alignment, InstructionType I>
@@ -408,6 +485,42 @@ FORCE_INLINE AccType *linear(AccType         *output,
     Affine::template forward<SignedInput, Bias, PreReLU, PostReLU>(output, input, weight, bias);
 
     return output + OutSize;
+}
+
+/// Apply one int8 linear layer to N inputs that share its weights (bit-identical to N calls
+/// of linear()). Only for layers handled by the input-broadcast kernel (output size a whole
+/// number of int32 registers), which is where reusing each weight load pays off.
+template <int             N,
+          int             OutSize,
+          int             InSize,
+          bool            SignedInput = false,
+          bool            Bias        = true,
+          bool            PreReLU     = false,
+          bool            PostReLU    = false,
+          int             Alignment   = NativeAlignment,
+          InstructionType Inst        = NativeInstType>
+FORCE_INLINE void linearMulti(int32_t *const      output[N],
+                              const int8_t *const input[N],
+                              const int8_t        weight[OutSize * InSize],
+                              const int32_t       bias[OutSize])
+{
+    static_assert(N >= 1);
+    static_assert(OutSize > 1 && detail::VecBatch<OutSize, int32_t, Inst, true>::NumExtra == 0,
+                  "linearMulti() needs the input-broadcast affine kernel");
+    static_assert(isAlignSizeOK(Alignment));
+    for (int n = 0; n < N; n++) {
+        assert(isPtrAligned<Alignment>(output[n]));
+        assert(isPtrAligned<Alignment>(input[n]));
+    }
+    assert(isPtrAligned<Alignment>(weight));
+    if constexpr (Bias)
+        assert(isPtrAligned<Alignment>(bias));
+
+    typedef detail::Affine<OutSize, InSize, int8_t, Alignment, Inst> Affine;
+    Affine::template forwardMulti<N, SignedInput, Bias, PreReLU, PostReLU>(output,
+                                                                           input,
+                                                                           weight,
+                                                                           bias);
 }
 
 }  // namespace Evaluation::simd

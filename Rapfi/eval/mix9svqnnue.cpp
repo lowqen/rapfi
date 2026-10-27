@@ -241,6 +241,64 @@ starBlock(int8_t output[OutSize], int8_t input[InSize], const StarBlockWeight<Ou
     simd::crelu<OutSize, 128>(output, outputi32);
 }
 
+/// starBlock() on N inputs that share one StarBlockWeight (the value head applies the corner,
+/// edge and quadrant blocks to four groups each). Bit-identical to N separate starBlock() calls.
+///
+/// The batched path reuses every weight load across the N inputs. It is taken with WASM relaxed
+/// SIMD, where the i8 dot product is a single op and loads are a large share of the work
+/// (measured +3.6~6.3% NPS there, but -3~5% on plain WASM SIMD, whose 8-op dot product leaves no
+/// registers for the larger tile), and on NEON with DotProd: AArch64 is load/store, so unlike x86
+/// (where the weight load folds into pmaddubsw and nothing changes) every saved load is a saved
+/// instruction. Measured on a Cortex-A76: +7.9% NPS with sdot, but -11.7% on plain NEON, where
+/// the 4-instruction dot product makes it the same trade as plain WASM SIMD.
+template <int N, int OutSize, int InSize>
+inline void starBlockMulti(int8_t *const                          output[N],
+                           int8_t *const                          input[N],
+                           const StarBlockWeight<OutSize, InSize> &w)
+{
+#if !defined(USE_WASM_SIMD_RELAXED) && !defined(USE_NEON_DOTPROD)
+    for (int n = 0; n < N; n++)
+        starBlock<OutSize, InSize>(output[n], input[n], w);
+#else
+    alignas(Alignment) int32_t upi32[N][OutSize * 2];
+    alignas(Alignment) int8_t  up1[N][OutSize * 2], up2[N][OutSize * 2];
+    alignas(Alignment) int8_t  dotsum[N][OutSize];
+    alignas(Alignment) int32_t outputi32[N][OutSize];
+    int32_t      *upi32Ptr[N], *outputi32Ptr[N];
+    const int8_t *inputPtr[N], *dotsumPtr[N];
+    for (int n = 0; n < N; n++) {
+        upi32Ptr[n]     = upi32[n];
+        outputi32Ptr[n] = outputi32[n];
+        inputPtr[n]     = input[n];
+        dotsumPtr[n]    = dotsum[n];
+    }
+
+    simd::linearMulti<N, OutSize * 2, InSize>(upi32Ptr,
+                                              inputPtr,
+                                              w.value_corner_up1.weight,
+                                              w.value_corner_up1.bias);
+    for (int n = 0; n < N; n++)
+        simd::crelu<OutSize * 2, 128>(up1[n], upi32[n]);
+
+    simd::linearMulti<N, OutSize * 2, InSize>(upi32Ptr,
+                                              inputPtr,
+                                              w.value_corner_up2.weight,
+                                              w.value_corner_up2.bias);
+    for (int n = 0; n < N; n++)
+        simd::crelu<OutSize * 2, 128, true>(up2[n], upi32[n]);
+
+    for (int n = 0; n < N; n++)
+        simd::dot2<OutSize, 128>(dotsum[n], up1[n], up2[n]);
+
+    simd::linearMulti<N, OutSize, OutSize, true>(outputi32Ptr,
+                                                 dotsumPtr,
+                                                 w.value_corner_down.weight,
+                                                 w.value_corner_down.bias);
+    for (int n = 0; n < N; n++)
+        simd::crelu<OutSize, 128>(output[n], outputi32[n]);
+#endif
+}
+
 }  // namespace
 
 namespace Evaluation::mix9svq {
@@ -578,15 +636,17 @@ std::tuple<float, float, float> Accumulator::evaluateValue(const Weight &w)
     // group linear layer
     alignas(Alignment) int8_t group1[ValueSumType::NGroup][ValueSumType::NGroup][ValueDim];
 
-    starBlock<ValueDim, FeatureDim>(group1[0][0], group0[0][0], bucket.value_corner);
-    starBlock<ValueDim, FeatureDim>(group1[0][2], group0[0][2], bucket.value_corner);
-    starBlock<ValueDim, FeatureDim>(group1[2][0], group0[2][0], bucket.value_corner);
-    starBlock<ValueDim, FeatureDim>(group1[2][2], group0[2][2], bucket.value_corner);
-
-    starBlock<ValueDim, FeatureDim>(group1[0][1], group0[0][1], bucket.value_edge);
-    starBlock<ValueDim, FeatureDim>(group1[1][0], group0[1][0], bucket.value_edge);
-    starBlock<ValueDim, FeatureDim>(group1[1][2], group0[1][2], bucket.value_edge);
-    starBlock<ValueDim, FeatureDim>(group1[2][1], group0[2][1], bucket.value_edge);
+    // The four corner groups share one block, and so do the four edge groups.
+    {
+        int8_t *const out[4] = {group1[0][0], group1[0][2], group1[2][0], group1[2][2]};
+        int8_t *const in[4]  = {group0[0][0], group0[0][2], group0[2][0], group0[2][2]};
+        starBlockMulti<4, ValueDim, FeatureDim>(out, in, bucket.value_corner);
+    }
+    {
+        int8_t *const out[4] = {group1[0][1], group1[1][0], group1[1][2], group1[2][1]};
+        int8_t *const in[4]  = {group0[0][1], group0[1][0], group0[1][2], group0[2][1]};
+        starBlockMulti<4, ValueDim, FeatureDim>(out, in, bucket.value_edge);
+    }
 
     starBlock<ValueDim, FeatureDim>(group1[1][1], group0[1][1], bucket.value_center);
 
@@ -615,19 +675,15 @@ std::tuple<float, float, float> Accumulator::evaluateValue(const Weight &w)
         I8LS::store(group2[1][1] + b * I8B::RegWidth, q11);
     }
 
-    // quadrant linear layer
-    starBlock<ValueDim, ValueDim>(layer0 + FeatureDim + 0 * ValueDim,
-                                  group2[0][0],
-                                  bucket.value_quad);
-    starBlock<ValueDim, ValueDim>(layer0 + FeatureDim + 1 * ValueDim,
-                                  group2[0][1],
-                                  bucket.value_quad);
-    starBlock<ValueDim, ValueDim>(layer0 + FeatureDim + 2 * ValueDim,
-                                  group2[1][0],
-                                  bucket.value_quad);
-    starBlock<ValueDim, ValueDim>(layer0 + FeatureDim + 3 * ValueDim,
-                                  group2[1][1],
-                                  bucket.value_quad);
+    // quadrant linear layer (the four quadrants share one block)
+    {
+        int8_t *const out[4] = {layer0 + FeatureDim + 0 * ValueDim,
+                                layer0 + FeatureDim + 1 * ValueDim,
+                                layer0 + FeatureDim + 2 * ValueDim,
+                                layer0 + FeatureDim + 3 * ValueDim};
+        int8_t *const in[4]  = {group2[0][0], group2[0][1], group2[1][0], group2[1][1]};
+        starBlockMulti<4, ValueDim, ValueDim>(out, in, bucket.value_quad);
+    }
 
     // linear 1
     alignas(Alignment) int32_t layer1i32[ValueDim];
