@@ -1207,6 +1207,8 @@ namespace detail {
         static FORCE_INLINE R add(R a, R b) { return simde_mm_add_epi16(a, b); }
         static FORCE_INLINE R sub(R a, R b) { return simde_mm_sub_epi16(a, b); }
         static FORCE_INLINE R mulhi(R a, R b) { return simde_mm_mulhi_epi16(a, b); }
+        /// mulhi(a, 2 * b). Bit-identical to mulhi(a, slli<1>(b)); NEON does it in one instruction.
+        static FORCE_INLINE R mulhi2x(R a, R b) { return mulhi(a, slli<1>(b)); }
         static FORCE_INLINE R min(R a, R b) { return simde_mm_min_epi16(a, b); }
         static FORCE_INLINE R max(R a, R b) { return simde_mm_max_epi16(a, b); }
         static FORCE_INLINE R avg(R a, R b) { return simde_mm_avg_epu16(a, b); }
@@ -1231,6 +1233,8 @@ namespace detail {
         static FORCE_INLINE R add(R a, R b) { return simde_mm256_add_epi16(a, b); }
         static FORCE_INLINE R sub(R a, R b) { return simde_mm256_sub_epi16(a, b); }
         static FORCE_INLINE R mulhi(R a, R b) { return simde_mm256_mulhi_epi16(a, b); }
+        /// mulhi(a, 2 * b). Bit-identical to mulhi(a, slli<1>(b)); NEON does it in one instruction.
+        static FORCE_INLINE R mulhi2x(R a, R b) { return mulhi(a, slli<1>(b)); }
         static FORCE_INLINE R min(R a, R b) { return simde_mm256_min_epi16(a, b); }
         static FORCE_INLINE R max(R a, R b) { return simde_mm256_max_epi16(a, b); }
         static FORCE_INLINE R avg(R a, R b) { return simde_mm256_avg_epu16(a, b); }
@@ -1268,6 +1272,8 @@ namespace detail {
         static FORCE_INLINE R add(R a, R b) { return _mm512_add_epi16(a, b); }
         static FORCE_INLINE R sub(R a, R b) { return _mm512_sub_epi16(a, b); }
         static FORCE_INLINE R mulhi(R a, R b) { return _mm512_mulhi_epi16(a, b); }
+        /// mulhi(a, 2 * b). Bit-identical to mulhi(a, slli<1>(b)); NEON does it in one instruction.
+        static FORCE_INLINE R mulhi2x(R a, R b) { return mulhi(a, slli<1>(b)); }
         static FORCE_INLINE R min(R a, R b) { return _mm512_min_epi16(a, b); }
         static FORCE_INLINE R max(R a, R b) { return _mm512_max_epi16(a, b); }
         static FORCE_INLINE R avg(R a, R b) { return _mm512_avg_epu16(a, b); }
@@ -1303,6 +1309,10 @@ namespace detail {
             int32x4_t ab7654 = vmull_high_s16(a, b);
             return vuzp2q_s16(vreinterpretq_s16_s32(ab3210), vreinterpretq_s16_s32(ab7654));
         }
+        /// mulhi(a, 2 * b) as one sqdmulh: sat((2 * a * b) >> 16) == mulhi(a, slli<1>(b)) whenever
+        /// slli<1>(b) does not overflow, i.e. b in [-16384, 16383] (saturation needs a == b == INT16_MIN).
+        /// Replaces mulhi's vmull_s16 + vmull_high_s16 + vuzp2q_s16.
+        static FORCE_INLINE R mulhi2x(R a, R b) { return vqdmulhq_s16(a, b); }
         static FORCE_INLINE R min(R a, R b) { return vminq_s16(a, b); }
         static FORCE_INLINE R max(R a, R b) { return vmaxq_s16(a, b); }
         static FORCE_INLINE R avg(R a, R b)
@@ -1343,6 +1353,8 @@ namespace detail {
             const R hi = wasm_i32x4_extmul_high_i16x8(a, b);
             return wasm_i16x8_shuffle(lo, hi, 1, 3, 5, 7, 9, 11, 13, 15);
         }
+        /// mulhi(a, 2 * b). Bit-identical to mulhi(a, slli<1>(b)); NEON does it in one instruction.
+        static FORCE_INLINE R mulhi2x(R a, R b) { return mulhi(a, slli<1>(b)); }
         static FORCE_INLINE R min(R a, R b) { return wasm_i16x8_min(a, b); }
         static FORCE_INLINE R max(R a, R b) { return wasm_i16x8_max(a, b); }
         static FORCE_INLINE R avg(R a, R b) { return wasm_u16x8_avgr(a, b); }

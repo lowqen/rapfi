@@ -302,7 +302,7 @@ void Accumulator::clear(const Weight &w)
                 for (int b = 0; b < ConvB::NumBatch; b++) {
                     auto feature = I16LS::load(mapSum[innerIdx].data() + b * FeatB::RegWidth);
                     feature      = I16Op::max(feature, I16Op::setzero());
-                    feature      = I16Op::slli<2>(feature);  // mul 4
+                    feature      = I16Op::slli<1>(feature);  // mul 2, mulhi2x doubles again
                     // Apply feature depthwise conv
                     for (int dy = 0; dy <= 2; dy++) {
                         int yi = y + dy;
@@ -312,7 +312,7 @@ void Accumulator::clear(const Weight &w)
 
                             auto *convWeightBase = w.feature_dwconv_weight[8 - dy * 3 - dx];
                             auto  convW     = I16LS::load(convWeightBase + b * ConvB::RegWidth);
-                            auto  deltaFeat = I16Op::mulhi(convW, feature);
+                            auto  deltaFeat = I16Op::mulhi2x(convW, feature);
                             auto  convPtr   = mapConv[outerIdx].data() + b * FeatB::RegWidth;
                             auto  convFeat  = I16LS::load(convPtr);
                             convFeat        = I16Op::add(convFeat, deltaFeat);
@@ -475,8 +475,8 @@ void Accumulator::move(const Weight &w, Color pieceColor, int x, int y)
 
         // Update mapConv
         for (int b = 0; b < ConvB::NumBatch; b++) {
-            oldFeats[b] = I16Op::slli<2>(oldFeats[b]);  // mul 4
-            newFeats[b] = I16Op::slli<2>(newFeats[b]);  // mul 4
+            oldFeats[b] = I16Op::slli<1>(oldFeats[b]);  // mul 2, see mulhi2x
+            newFeats[b] = I16Op::slli<1>(newFeats[b]);  // mul 2, see mulhi2x
         }
         for (int dy = 0, outerIdxBase = c.y * outerBoardSize + c.x; dy <= 2;
              dy++, outerIdxBase += outerBoardSize) {
@@ -488,8 +488,8 @@ void Accumulator::move(const Weight &w, Color pieceColor, int x, int y)
 
                 for (int b = 0; b < ConvB::NumBatch; b++) {
                     auto convW      = I16LS::load(convWeightBase + b * ConvB::RegWidth);
-                    auto deltaConvF = I16Op::sub(I16Op::mulhi(convW, newFeats[b]),
-                                                 I16Op::mulhi(convW, oldFeats[b]));
+                    auto deltaConvF = I16Op::sub(I16Op::mulhi2x(convW, newFeats[b]),
+                                                 I16Op::mulhi2x(convW, oldFeats[b]));
 
                     auto convPtr  = convBase + b * ConvB::RegWidth;
                     auto oldConvF = I16LS::load(convPtr);
