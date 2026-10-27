@@ -35,6 +35,7 @@ namespace Evaluation::mix9svq {
 // (see mix9svqnnue.cpp); only the Evaluator plugin surface is public.
 struct Weight;
 class Accumulator;
+struct PolicyCache;
 
 class Evaluator : public Evaluation::Evaluator
 {
@@ -62,6 +63,8 @@ private:
     Weight /* non-owning ptr */ *weight[2];
     std::unique_ptr<Accumulator> accumulator[2];
     std::vector<mixnet::MoveCache> moveCache[2];
+    /// Policy outputs already computed for recent positions (A4, see mix9svqnnue.cpp).
+    std::unique_ptr<PolicyCache> policyCache;
 };
 
 }  // namespace Evaluation::mix9svq
