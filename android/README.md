@@ -7,9 +7,13 @@ one commit each: K1–K3 and K7 (speed), R4 P2-2 (no weight reload when the thre
 count changes), R4 P4-1 (periodic node counters, output only), and the database
 save patches DB1 (atomic save through `<path>.tmp` + rename; saving no longer
 stops or blocks the search), DB2 (`INFO USEDATABASE 1` keeps an attached database)
-and DB4 (the save runs on a background thread). BENCH stays `e240ab16`.
+DB4 (the save runs on a background thread), DB5 (the yixindb records live in a
+compact sorted table: same file bytes and answers, about a third of the memory)
+and DB6 (`[database.yixindb] journal = true` saves only the changed records to
+`<path>.journal`, folded into the file past `journal_compact_percent` or on
+`YXCOMPACTDATABASE`). BENCH stays `e240ab16`.
 
-The dotprod profile predates DB1–DB4; the compiler discards it only for the changed
+The dotprod profile predates DB1–DB6; the compiler discards it only for the changed
 database/protocol functions (none of them on the search path).
 
 RapfiDroid ships two executables, picked at run time by the CPU:
