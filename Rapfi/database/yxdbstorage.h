@@ -20,9 +20,12 @@
 
 #include "dbstorage.h"
 
+#include <atomic>
 #include <filesystem>
 #include <map>
+#include <mutex>
 #include <shared_mutex>
+#include <vector>
 
 namespace Database {
 
@@ -126,6 +129,16 @@ public:
     // -------------------------------------------------------------------
 
 private:
+    /// A write (set/del) that arrived while flush() was serializing the map.
+    /// It is replayed onto the map once the file is written.
+    struct PendingOp
+    {
+        DBKey        key;
+        DBRecord     record;
+        DBRecordMask mask;
+        bool         isDelete;
+    };
+
     std::filesystem::path                             filePath;
     std::map<CompactDBKey, DBRecord, CompactDBKeyCmp> recordsMap;
     std::shared_mutex                                 mutex;
@@ -134,10 +147,25 @@ private:
     bool                                              saveOnClose;
     bool                                              dirty;
 
+    // flush() serializes under a *shared* lock so that search threads keep
+    // reading the database while it is being saved. Writes arriving during
+    // that window are queued here instead of waiting for the exclusive lock.
+    // Lock order: pendingMutex -> mutex (writers and flush); readers never
+    // hold mutex while taking pendingMutex.
+    std::mutex             pendingMutex;
+    std::mutex             flushMutex;  // one flush at a time
+    bool                   saving = false;  // guarded by pendingMutex
+    std::atomic<bool>      savingHint {false};  // lock-free fast path for get()
+    std::vector<PendingOp> pendingOps;  // guarded by pendingMutex
+
     /// Loads all data from current stream into memory.
     void load(std::istream &is, bool ignoreCorrupted);
     /// Save the current in-memory data to the opened file.
     void save(std::ostream &os) noexcept;
+    /// Writes the whole map to `path`. Caller holds at least a shared lock.
+    bool writeFile(const std::filesystem::path &path) noexcept;
+    /// Apply one write to the map. Caller holds the unique lock.
+    void applyLocked(const DBKey &key, const DBRecord &record, DBRecordMask mask, bool isDelete);
 };
 
 }  // namespace Database

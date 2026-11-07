@@ -801,6 +801,9 @@ bool runProtocol()
     // clang-format off
     if (cmd == "END")                          return Search::Engine.stopThinking(), true;
     else if (cmd == "STOP" || cmd == "YXSTOP") return Search::Engine.stopThinking(), false;
+    // Saving only reads the storage (writes from search are queued meanwhile), so it
+    // neither stops nor waits for a running search or ponder.
+    else if (cmd == "YXSAVEDATABASE")          { auto ctx = dbCommandContext(); saveDatabase(ctx); return false; }
     else if (thinking)                         return false;
 
 #ifdef MULTI_THREADING
@@ -826,7 +829,6 @@ bool runProtocol()
     else if (cmd == "YXHASHDUMP")          dumpHash();
     else if (cmd == "YXHASHLOAD")          loadHash();
     else if (cmd == "YXSETDATABASE")       setDatabase();
-    else if (cmd == "YXSAVEDATABASE")      { auto ctx = dbCommandContext(); saveDatabase(ctx); }
     else if (cmd == "YXDBTOTXTALL")        { auto ctx = dbCommandContext(); databaseToTxt(ctx, false); }
     else if (cmd == "YXDBTOTXT")           { auto ctx = dbCommandContext(); databaseToTxt(ctx, true); }
     else if (cmd == "YXLIBTODB")           { auto ctx = dbCommandContext(); libToDatabase(ctx); }

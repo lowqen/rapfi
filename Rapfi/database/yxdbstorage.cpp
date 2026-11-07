@@ -72,6 +72,14 @@ YXDBStorage::YXDBStorage(std::filesystem::path filePath,
     , saveOnClose(saveOnClose)
     , dirty(false)
 {
+    // A leftover from a save that was killed midway: the real file is intact.
+    {
+        std::error_code ec;
+        std::filesystem::path tmpPath = filePath;
+        tmpPath += ".tmp";
+        std::filesystem::remove(tmpPath, ec);
+    }
+
     if (!std::filesystem::exists(filePath))
         return;
 
@@ -113,47 +121,146 @@ YXDBStorage::~YXDBStorage()
 
 bool YXDBStorage::get(const DBKey &key, DBRecord &record, DBRecordMask mask) noexcept
 {
+    // Writes queued by a running flush() are newer than the map. Collect the
+    // ones for this key before taking the map lock (lock order, see header).
+    // Replaying an op the flush already applied is harmless: every op is
+    // idempotent when the whole queued sequence is replayed in order.
+    std::vector<PendingOp> ops;
+    if (savingHint.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> pendingLock(pendingMutex);
+        for (const PendingOp &op : pendingOps)
+            if (databaseKeyCompare(op.key, key) == 0)
+                ops.push_back(op);
+    }
+
     std::shared_lock<std::shared_mutex> readerLock(mutex);
 
-    if (auto it = recordsMap.find(key); it != recordsMap.end()) {
+    auto it = recordsMap.find(key);
+    if (ops.empty()) {
+        if (it == recordsMap.end())
+            return false;
         record.update(it->second, mask);
         return true;
     }
+
+    bool     exists = it != recordsMap.end();
+    DBRecord merged = exists ? it->second : DBRecord {};
+    readerLock.unlock();
+    for (const PendingOp &op : ops) {
+        if (op.isDelete)
+            exists = false;
+        else if (exists)
+            merged.update(op.record, op.mask);
+        else
+            merged = op.record, exists = true;
+    }
+    if (exists)
+        record.update(merged, mask);
+    return exists;
+}
+
+void YXDBStorage::applyLocked(const DBKey      &key,
+                              const DBRecord   &record,
+                              DBRecordMask      mask,
+                              bool              isDelete)
+{
+    auto it = recordsMap.find(key);
+    if (isDelete) {
+        if (it != recordsMap.end()) {
+            recordsMap.erase(it);
+            dirty = true;
+        }
+        return;
+    }
+
+    if (it != recordsMap.end())
+        it->second.update(record, mask);
     else
-        return false;
+        recordsMap.insert(std::make_pair(key, record));
+    dirty = true;
 }
 
 void YXDBStorage::set(const DBKey &key, const DBRecord &record, DBRecordMask mask) noexcept
 {
+    std::unique_lock<std::mutex> pendingLock(pendingMutex);
+    if (saving) {
+        pendingOps.push_back({key, record, mask, false});
+        return;
+    }
+    // Take the map lock before releasing pendingMutex: flush() then cannot
+    // start serializing between our check and our write.
     std::unique_lock<std::shared_mutex> writerLock(mutex);
-
-    if (auto it = recordsMap.find(key); it != recordsMap.end())
-        it->second.update(record, mask);
-    else
-        recordsMap.insert(std::make_pair(key, record));
-
-    dirty = true;
+    pendingLock.unlock();
+    applyLocked(key, record, mask, false);
 }
 
 void YXDBStorage::del(const DBKey &key) noexcept
 {
-    std::unique_lock<std::shared_mutex> writerLock(mutex);
-
-    if (auto it = recordsMap.find(key); it != recordsMap.end()) {
-        recordsMap.erase(it);
-        dirty = true;
+    std::unique_lock<std::mutex> pendingLock(pendingMutex);
+    if (saving) {
+        pendingOps.push_back({key, DBRecord {}, RECORD_MASK_NONE, true});
+        return;
     }
+    std::unique_lock<std::shared_mutex> writerLock(mutex);
+    pendingLock.unlock();
+    applyLocked(key, DBRecord {}, RECORD_MASK_NONE, true);
+}
+
+bool YXDBStorage::writeFile(const std::filesystem::path &path) noexcept
+{
+    std::ofstream file;
+    std::vector<char> fileBuffer(1 << 20);
+    file.rdbuf()->pubsetbuf(fileBuffer.data(), fileBuffer.size());
+    file.open(path, std::ios::binary | std::ios::trunc);
+    if (!file.is_open())
+        return false;
+
+    {
+        Compressor    compressor(static_cast<std::ostream &>(file),
+                              compressedSave ? Compressor::Type::LZ4_DEFAULT
+                                                : Compressor::Type::NO_COMPRESS);
+        std::ostream *ostreamPtr = compressor.openOutputStream();
+        if (!ostreamPtr || !*ostreamPtr)
+            return false;
+        save(*ostreamPtr);
+        if (!*ostreamPtr)
+            return false;
+    }  // the compressor writes the LZ4 end mark here
+
+    file.close();
+    return !file.fail();
 }
 
 bool YXDBStorage::flush() noexcept
 {
-    std::unique_lock<std::shared_mutex> lock(mutex);
+    std::lock_guard<std::mutex> flushLock(flushMutex);
 
-    if (!dirty && std::filesystem::exists(filePath))
-        return true;
+    {
+        std::lock_guard<std::mutex>         pendingLock(pendingMutex);
+        std::shared_lock<std::shared_mutex> readerLock(mutex);  // waits for in-flight writers
+        if (!dirty && std::filesystem::exists(filePath))
+            return true;
+        dirty  = false;
+        saving = true;
+        savingHint.store(true, std::memory_order_release);
+    }
 
-    // Backup previous file first
-    if (numBackupsOnSave && std::filesystem::exists(filePath)) {
+    MESSAGEL("DATABASE SAVE START " + pathToConsoleString(filePath));
+
+    // 1. Write the complete new file next to the old one. Search threads keep
+    //    reading (shared lock); their writes are queued in pendingOps.
+    std::filesystem::path tmpPath = filePath;
+    tmpPath += ".tmp";
+    bool ok;
+    {
+        std::shared_lock<std::shared_mutex> readerLock(mutex);
+        ok = writeFile(tmpPath);
+    }
+
+    // 2. Only a fully written file replaces the old one. The old file stays
+    //    untouched if anything above failed (disk full, killed mid-write).
+    std::error_code ec;
+    if (ok) {
         auto makeBackupFilePath = [this](int index) -> std::filesystem::path {
             std::filesystem::path backupPath = filePath;
             std::string           indexStr   = std::to_string(index);
@@ -164,34 +271,57 @@ bool YXDBStorage::flush() noexcept
             return backupPath;
         };
 
-        for (int i = numBackupsOnSave; i > 0; i--) {
-            std::filesystem::path toClearPath = i == 1 ? filePath : makeBackupFilePath(i - 1);
-            std::filesystem::path backupPath  = makeBackupFilePath(i);
-
-            std::error_code ec;
-            // Remove previous backup file
-            std::filesystem::remove(backupPath, ec);
-            // Move current file to be cleared to the previous backup file
-            std::filesystem::rename(toClearPath, backupPath, ec);
+        if (numBackupsOnSave && std::filesystem::exists(filePath)) {
+            for (int i = numBackupsOnSave; i > 1; i--) {
+                std::filesystem::remove(makeBackupFilePath(i), ec);
+                std::filesystem::rename(makeBackupFilePath(i - 1), makeBackupFilePath(i), ec);
+            }
+            // Keep the current file in place while making backup #1, so the
+            // database path never points at nothing: a hard link costs nothing;
+            // where links are refused (Android apps, FAT) copy it; only if that
+            // fails too, fall back to the original move.
+            auto bak1 = makeBackupFilePath(1);
+            std::filesystem::remove(bak1, ec);
+            std::filesystem::create_hard_link(filePath, bak1, ec);
+            if (ec)
+                std::filesystem::copy_file(filePath, bak1, ec);
+            if (ec) {
+                std::filesystem::remove(bak1, ec);
+                std::filesystem::rename(filePath, bak1, ec);
+            }
         }
+
+        std::filesystem::rename(tmpPath, filePath, ec);  // replaces atomically on POSIX
+        if (ec) {
+            // Some Windows runtimes refuse to rename over an existing file.
+            std::error_code ec2;
+            std::filesystem::remove(filePath, ec2);
+            std::filesystem::rename(tmpPath, filePath, ec);
+        }
+        ok = !ec;
+    }
+    if (!ok)
+        std::filesystem::remove(tmpPath, ec);
+
+    // 3. Replay the writes that arrived meanwhile; they are not in the file.
+    {
+        std::lock_guard<std::mutex>         pendingLock(pendingMutex);
+        std::unique_lock<std::shared_mutex> writerLock(mutex);
+        for (const PendingOp &op : pendingOps)
+            applyLocked(op.key, op.record, op.mask, op.isDelete);
+        pendingOps.clear();
+        pendingOps.shrink_to_fit();
+        if (!ok)
+            dirty = true;
+        saving = false;
+        savingHint.store(false, std::memory_order_release);
     }
 
-    std::ofstream file(filePath, std::ios::binary | std::ios::trunc);
-    if (file.is_open()) {
-        Compressor    compressor(static_cast<std::ostream &>(file),
-                              compressedSave ? Compressor::Type::LZ4_DEFAULT
-                                                : Compressor::Type::NO_COMPRESS);
-        std::ostream *ostreamPtr = compressor.openOutputStream();
-        if (ostreamPtr && *ostreamPtr) {
-            MESSAGEL("DATABASE SAVE START " + pathToConsoleString(filePath));
-            save(*ostreamPtr);
-            dirty = false;
-            MESSAGEL("DATABASE SAVE DONE");
-            return true;
-        }
+    if (ok) {
+        MESSAGEL("DATABASE SAVE DONE");
+        return true;
     }
-
-    ERRORL("Failed to open YXDB file at " + pathToConsoleString(filePath));
+    ERRORL("Failed to save YXDB file at " + pathToConsoleString(filePath));
     return false;
 }
 
@@ -389,6 +519,15 @@ void YXDBStorage::save(std::ostream &os) noexcept
         os.write(metadata.c_str(), metadata.length());
     }
 
+    // Records are tiny (~80 bytes); serialize them into a chunk and hand the
+    // compressor large writes instead of ~6 small writes per record.
+    constexpr size_t ChunkSize = 1 << 20;
+    std::string      chunk;
+    chunk.reserve(ChunkSize + 4096);
+    auto put = [&chunk](const void *p, size_t n) {
+        chunk.append(reinterpret_cast<const char *>(p), n);
+    };
+
     const int8_t PassMove[2] = {-1, -1};
     for (auto it = recordsMap.cbegin(); it != recordsMap.cend(); it++) {
         const CompactDBKey &key    = it->first;
@@ -400,32 +539,36 @@ void YXDBStorage::save(std::ostream &os) noexcept
         uint16_t numKeyBytes =
             3 + 2 * (key.whiteStonesEnd() - key.blackStonesBegin() + addPassMove);
 
-        os.write(reinterpret_cast<char *>(&numKeyBytes), sizeof(numKeyBytes));
-        os.write(reinterpret_cast<const char *>(&key), 3);
-        os.write(reinterpret_cast<const char *>(key.blackStonesBegin()),
-                 (key.blackStonesEnd() - key.blackStonesBegin()) * 2);
+        put(&numKeyBytes, sizeof(numKeyBytes));
+        put(&key, 3);
+        put(key.blackStonesBegin(), (key.blackStonesEnd() - key.blackStonesBegin()) * 2);
         if (addPassMove && normalSTM == BLACK)
-            os.write(reinterpret_cast<const char *>(PassMove), 2);
-        os.write(reinterpret_cast<const char *>(key.whiteStonesBegin()),
-                 (key.whiteStonesEnd() - key.whiteStonesBegin()) * 2);
+            put(PassMove, 2);
+        put(key.whiteStonesBegin(), (key.whiteStonesEnd() - key.whiteStonesBegin()) * 2);
         if (addPassMove && normalSTM == WHITE)
-            os.write(reinterpret_cast<const char *>(PassMove), 2);
+            put(PassMove, 2);
 
         // Write record message
         if (record.isNull()) {
             uint16_t numRecordBytes = 0;
-            os.write(reinterpret_cast<char *>(&numRecordBytes), sizeof(numRecordBytes));
+            put(&numRecordBytes, sizeof(numRecordBytes));
         }
         else {
             const std::string &utf8Text       = record.text;
             uint16_t           numRecordBytes = 5 + utf8Text.length();
-            os.write(reinterpret_cast<char *>(&numRecordBytes), sizeof(numRecordBytes));
-            os.write(reinterpret_cast<const char *>(&record.label), sizeof(DBLabel));
-            os.write(reinterpret_cast<const char *>(&record.value), sizeof(DBValue));
-            os.write(reinterpret_cast<const char *>(&record.depthbound), sizeof(DBDepthBound));
-            os.write(utf8Text.c_str(), utf8Text.length());
+            put(&numRecordBytes, sizeof(numRecordBytes));
+            put(&record.label, sizeof(DBLabel));
+            put(&record.value, sizeof(DBValue));
+            put(&record.depthbound, sizeof(DBDepthBound));
+            put(utf8Text.data(), utf8Text.length());
+        }
+
+        if (chunk.size() >= ChunkSize) {
+            os.write(chunk.data(), chunk.size());
+            chunk.clear();
         }
     }
+    os.write(chunk.data(), chunk.size());
 }
 
 }  // namespace Database
