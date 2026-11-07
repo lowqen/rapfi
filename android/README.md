@@ -4,8 +4,13 @@ This branch is the corresponding source of the engine shipped in RapfiDroid
 (https://github.com/lowqen/RapfiDroid): upstream dhbloo/rapfi `3c94c2a9`, the
 Android build changes in `Rapfi/CMakeLists.txt`, and result-invariant patches,
 one commit each: K1–K3 and K7 (speed), R4 P2-2 (no weight reload when the thread
-count changes) and R4 P4-1 (periodic node counters, output only). BENCH stays
-`e240ab16`.
+count changes), R4 P4-1 (periodic node counters, output only), and the database
+save patches DB1 (atomic save through `<path>.tmp` + rename; saving no longer
+stops or blocks the search), DB2 (`INFO USEDATABASE 1` keeps an attached database)
+and DB4 (the save runs on a background thread). BENCH stays `e240ab16`.
+
+The dotprod profile predates DB1–DB4; the compiler discards it only for the changed
+database/protocol functions (none of them on the search path).
 
 RapfiDroid ships two executables, picked at run time by the CPU:
 
