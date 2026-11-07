@@ -23,8 +23,11 @@
 #include <atomic>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace Database {
@@ -139,9 +142,67 @@ private:
         bool         isDelete;
     };
 
-    std::filesystem::path                             filePath;
-    std::map<CompactDBKey, DBRecord, CompactDBKeyCmp> recordsMap;
-    std::shared_mutex                                 mutex;
+    /// One record of the sorted main table (20 bytes). The key's stones live
+    /// in the key arena: one byte per stone ((x << 4) | y) on boards up to
+    /// 16x16, otherwise the original two bytes (x, y). A narrow byte sorts
+    /// exactly like the (x, y) pair memcmp() compares, so the main table keeps
+    /// the order of databaseKeyCompare(). Text is rare (0.2% of records in the
+    /// field) and sits in a side table keyed by keyOff.
+    struct Entry
+    {
+        uint32_t     keyOff;
+        uint16_t     numBlackStones;
+        uint16_t     numWhiteStones;
+        uint8_t      rule;
+        int8_t       boardWidth;
+        int8_t       boardHeight;
+        uint8_t      flags;
+        DBLabel      label;
+        DBValue      value;
+        DBDepthBound depthbound;
+    };
+    enum EntryFlag : uint8_t {
+        ENTRY_WHITE_TO_MOVE = 1 << 0,
+        ENTRY_DELETED       = 1 << 1,
+        ENTRY_HAS_TEXT      = 1 << 2,
+    };
+    using OverlayMap = std::map<CompactDBKey, DBRecord, CompactDBKeyCmp>;
+
+    /// Append-only storage of packed stones, in 1MB blocks: growing never
+    /// moves existing keys, so loading has no reallocation peak.
+    class KeyArena
+    {
+    public:
+        static constexpr uint32_t BlockBits = 20;
+        static constexpr uint32_t BlockSize = 1u << BlockBits;
+        const uint8_t            *at(uint32_t off) const
+        {
+            return blocks[off >> BlockBits].get() + (off & (BlockSize - 1));
+        }
+        /// Reserves n contiguous bytes. Returns false if the arena is full (4GB).
+        bool allocate(uint32_t n, uint32_t &off, uint8_t *&ptr);
+        void clear()
+        {
+            blocks.clear();
+            used = BlockSize;
+        }
+        size_t memoryBytes() const { return blocks.size() * size_t(BlockSize); }
+
+    private:
+        std::vector<std::unique_ptr<uint8_t[]>> blocks;
+        uint32_t                                used = BlockSize;  // used bytes of the last block
+    };
+
+    std::filesystem::path filePath;
+    // The records: a sorted vector loaded from the file, plus new keys added
+    // since in a small map. Updates of keys in the main table happen in place,
+    // deletes only flag them. mergeOverlay() folds the map back in.
+    std::vector<Entry>                        entries;
+    KeyArena                                  keyArena;
+    std::unordered_map<uint32_t, std::string> entryTexts;  // keyOff -> utf-8 text
+    size_t                                    numLiveEntries = 0;
+    OverlayMap                                overlay;
+    std::shared_mutex                         mutex;
     int                                               numBackupsOnSave;
     bool                                              compressedSave;
     bool                                              saveOnClose;
@@ -166,6 +227,33 @@ private:
     bool writeFile(const std::filesystem::path &path) noexcept;
     /// Apply one write to the map. Caller holds the unique lock.
     void applyLocked(const DBKey &key, const DBRecord &record, DBRecordMask mask, bool isDelete);
+
+    // Main table helpers. Caller holds the lock (shared for reads).
+    static bool isNarrow(int width, int height) { return width <= 16 && height <= 16; }
+    /// Three-way compare of a main entry against any key with a `stones` array,
+    /// in databaseKeyCompare() order.
+    template <typename Key>
+    int compareEntry(const Entry &e, const Key &key) const;
+    /// Index of the first main entry not less than key (deleted ones included).
+    template <typename Key>
+    size_t lowerBound(const Key &key) const;
+    template <typename Key>
+    size_t upperBound(const Key &key) const;
+    /// Index of the live main entry equal to key, or SIZE_MAX.
+    size_t findEntry(const DBKey &key, bool includeDeleted = false) const;
+    DBRecord entryRecord(const Entry &e) const;
+    void     setEntryRecord(Entry &e, const DBRecord &record);
+    DBKey    entryKey(const Entry &e) const;
+    /// Packs key into a new main entry (record fields unset). False if it does
+    /// not fit the narrow encoding (a coordinate outside 0..15) or the arena.
+    template <typename Key>
+    bool makeEntry(const Key &key, Entry &e);
+    /// Folds the overlay into the sorted main table and drops deleted entries
+    /// (their arena bytes stay until the next load). Caller holds the unique lock.
+    void mergeOverlay();
+    /// Writes one record in the yixindb layout.
+    template <typename Put, typename Key>
+    static void putRecord(Put &put, const Key &key, const DBRecord &record);
 };
 
 }  // namespace Database
