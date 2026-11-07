@@ -87,15 +87,19 @@ void waitDatabaseSave()
 }
 
 /// YXSAVEDATABASE: prints "Saved database file using N ms." when done, as before.
-void startDatabaseSave()
+/// YXCOMPACTDATABASE (compact = true): the same, but folds a journal into the file.
+void startDatabaseSave(bool compact = false)
 {
     Database::DBStorage *storage = Search::Engine.dbStorage();
     if (!storage)
         return;
 
-    auto saveNow = [storage] {
+    auto saveNow = [storage, compact] {
         auto startTime = now();
-        storage->flush();
+        if (compact)
+            storage->compact();
+        else
+            storage->flush();
         MESSAGEL("Saved database file using " << (now() - startTime) << " ms.");
     };
 
@@ -860,6 +864,7 @@ bool runProtocol()
     // Saving only reads the storage (writes from search are queued meanwhile), so it
     // neither stops nor waits for a running search or ponder.
     else if (cmd == "YXSAVEDATABASE")          return startDatabaseSave(), false;
+    else if (cmd == "YXCOMPACTDATABASE")       return startDatabaseSave(true), false;
     else if (thinking)                         return false;
 
 #ifdef MULTI_THREADING

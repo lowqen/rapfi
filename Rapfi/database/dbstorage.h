@@ -223,6 +223,12 @@ public:
     /// return Whether the flush operation succeeded.
     virtual bool flush() noexcept = 0;
 
+    /// Like flush(), but leaves the storage in its plain, self-contained form
+    /// (for a storage with a differential journal: rewrite the whole file and
+    /// fold the journal in). Use before the file is copied or handed to
+    /// another program. Defaults to flush().
+    virtual bool compact() noexcept { return flush(); }
+
     /// Return the number of entries in the database.
     virtual size_t size() noexcept = 0;
 

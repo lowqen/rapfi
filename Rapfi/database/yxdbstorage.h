@@ -111,8 +111,10 @@ public:
     YXDBStorage(std::filesystem::path filePath,
                 bool                  compressedSave,
                 bool                  saveOnClose,
-                int                   numBackupsOnSave = 1,
-                bool                  ignoreCorrupted  = false);
+                int                   numBackupsOnSave      = 1,
+                bool                  ignoreCorrupted       = false,
+                bool                  journal               = false,
+                int                   journalCompactPercent = 25);
     /// Close the yixin database. All unsaved records will be flushed to file.
     virtual ~YXDBStorage();
 
@@ -125,6 +127,7 @@ public:
     void   set(const DBKey &key, const DBRecord &record, DBRecordMask mask) noexcept override;
     void   del(const DBKey &key) noexcept override;
     bool   flush() noexcept override;
+    bool   compact() noexcept override;
     size_t size() noexcept override;
     Cursor scan(Cursor                                   cursor,
                 size_t                                   count,
@@ -219,12 +222,38 @@ private:
     std::atomic<bool>      savingHint {false};  // lock-free fast path for get()
     std::vector<PendingOp> pendingOps;  // guarded by pendingMutex
 
+    // Differential save (see the journal section of the .cpp).
+    bool        journalEnabled;
+    int         journalCompactPercent;
+    bool        journalReplaying = false;
+    bool        fullSaveRequired = false;  // next flush rewrites the file (flushMutex)
+    std::string journalBuf;                // ops since the last flush (unique lock)
+    uint32_t    journalOps       = 0;      // ops in journalBuf (unique lock)
+    uint64_t    journalValidSize = 0;      // good bytes of <db>.journal, 0 = none (flushMutex)
+    uint64_t    baseSize         = 0;      // identity of the file the journal
+    uint64_t    baseTailHash     = 0;      // extends (flushMutex)
+
     /// Loads all data from current stream into memory.
     void load(std::istream &is, bool ignoreCorrupted);
     /// Save the current in-memory data to the opened file.
     void save(std::ostream &os) noexcept;
     /// Writes the whole map to `path`. Caller holds at least a shared lock.
     bool writeFile(const std::filesystem::path &path) noexcept;
+    /// flush()/compact(). Caller holds nothing.
+    bool flushImpl(bool compact) noexcept;
+    /// Rewrites the whole file (atomic, non-blocking) and resets the journal.
+    /// Caller holds flushMutex.
+    bool fullSave() noexcept;
+
+    // Journal. Caller holds flushMutex (or is the constructor).
+    std::filesystem::path journalPath() const;
+    static bool fileIdentity(const std::filesystem::path &path, uint64_t &size, uint64_t &hash);
+    void        replayJournal();
+    bool        appendJournal(const std::string &buf, uint32_t ops);
+    bool        resetJournal();
+    // Record one change into journalBuf. Caller holds the unique lock.
+    void journalPut(const DBKey &key, const DBRecord &record);
+    void journalDel(const DBKey &key);
     /// Apply one write to the map. Caller holds the unique lock.
     void applyLocked(const DBKey &key, const DBRecord &record, DBRecordMask mask, bool isDelete);
 
@@ -251,9 +280,17 @@ private:
     /// Folds the overlay into the sorted main table and drops deleted entries
     /// (their arena bytes stay until the next load). Caller holds the unique lock.
     void mergeOverlay();
-    /// Writes one record in the yixindb layout.
+    /// Writes one key / record body / record in the yixindb layout.
     template <typename Put, typename Key>
-    static void putRecord(Put &put, const Key &key, const DBRecord &record);
+    static void putKey(Put &put, const Key &key);
+    template <typename Put>
+    static void putBody(Put &put, const DBRecord &record);
+    template <typename Put, typename Key>
+    static void putRecord(Put &put, const Key &key, const DBRecord &record)
+    {
+        putKey(put, key);
+        putBody(put, record);
+    }
 };
 
 }  // namespace Database

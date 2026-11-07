@@ -60,6 +60,11 @@ struct DatabaseConfig
         bool saveOnClose      = true;
         int  numBackupsOnSave = 1;
         bool ignoreCorrupted  = false;
+        /// Save changes to <db>.journal instead of rewriting the whole file;
+        /// the file is rewritten (journal folded in) once the journal grows
+        /// past journalCompactPercent of the file, or on YXCOMPACTDATABASE.
+        bool journal               = false;
+        int  journalCompactPercent = 25;
     } yixindb;
 
     /// Parse state, not a TOML knob: mirrors the legacy null-DatabaseMaker

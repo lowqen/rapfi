@@ -36,7 +36,9 @@ std::unique_ptr<DBStorage> openDBStorage(const DatabaseConfig &cfg, std::string 
                                              cfg.yixindb.compressedSave,
                                              cfg.yixindb.saveOnClose,
                                              cfg.yixindb.numBackupsOnSave,
-                                             cfg.yixindb.ignoreCorrupted);
+                                             cfg.yixindb.ignoreCorrupted,
+                                             cfg.yixindb.journal,
+                                             cfg.yixindb.journalCompactPercent);
     }
     throw std::invalid_argument("unknown database type " + cfg.type);
 }

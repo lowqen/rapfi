@@ -555,6 +555,10 @@ void Config::readDatabase(const cpptoml::table &t, PendingConfig &pending)
                 args->get_as<int>("num_backups_on_save").value_or(cfg.yixindb.numBackupsOnSave);
             cfg.yixindb.ignoreCorrupted =
                 args->get_as<bool>("ignore_corrupted").value_or(cfg.yixindb.ignoreCorrupted);
+            cfg.yixindb.journal = args->get_as<bool>("journal").value_or(cfg.yixindb.journal);
+            cfg.yixindb.journalCompactPercent =
+                args->get_as<int>("journal_compact_percent")
+                    .value_or(cfg.yixindb.journalCompactPercent);
         }
         cfg.factoryEnabled = true;
     }
